@@ -31,7 +31,7 @@ shogi_games: dict[int, ShogiGame] = {}
 
 MOVE_RE = re.compile(r"^\s*(\d{1,2})\s+(\d{1,2})\s*$")
 SHOGI_MOVE_RE = re.compile(r"^[1-9]{4}$")
-SHOGI_DROP_RE = re.compile(r"^[PLNSGBR]\*[1-9]{2}$")
+SHOGI_DROP_RE = re.compile(r"^(fu|kyou|kei|gin|kin|kaku|hisya|ou)[1-9]{2}$", re.IGNORECASE)
 SHOGI_YN_RE = re.compile(r"^[ynYN]$")
 
 
@@ -341,7 +341,7 @@ async def shogi_start(interaction: discord.Interaction, opponent: discord.Member
 
     await thread.send(f"開始: 先手={interaction.user.mention}, 後手={opponent.mention}")
     await _send_shogi_image(thread, game)
-    await thread.send("入力: 移動 `7776` / 打ち駒 `P*77`。成り可能時は bot が y/n を確認します。")
+    await thread.send("入力: 移動 `7776` / 打ち駒 `fu77`。成り可能時は bot が y/n を確認します。")
 
 
 @client.tree.command(name="shogi_show", description="将棋盤を再表示（スレッド内）")
@@ -435,7 +435,7 @@ async def on_message(message: discord.Message):
             return
 
         text = message.content.strip()
-        upper = text.upper()
+        lower = text.lower()
 
         if shogi_game.pending_move is not None:
             if SHOGI_YN_RE.fullmatch(text):
@@ -448,7 +448,7 @@ async def on_message(message: discord.Message):
                     shogi_games.pop(thread.id, None)
                 return
 
-            if SHOGI_MOVE_RE.fullmatch(text) or SHOGI_DROP_RE.fullmatch(upper):
+            if SHOGI_MOVE_RE.fullmatch(text) or SHOGI_DROP_RE.fullmatch(lower):
                 await thread.send(f"{message.author.mention} まず y/n を答えてください。")
             else:
                 await thread.send(f"{message.author.mention} 成りますか？ y/n で答えてください。")
@@ -468,10 +468,21 @@ async def on_message(message: discord.Message):
                 shogi_games.pop(thread.id, None)
             return
 
-        if SHOGI_DROP_RE.fullmatch(upper):
-            kind = upper[0]
-            tx = int(upper[2])
-            ty = int(upper[3])
+        if SHOGI_DROP_RE.fullmatch(lower):
+            romaji_to_kind = {
+                "fu": "P",
+                "kyou": "L",
+                "kei": "N",
+                "gin": "S",
+                "kin": "G",
+                "kaku": "B",
+                "hisya": "R",
+                "ou": "K",
+            }
+            kind_token = lower[:-2]
+            kind = romaji_to_kind[kind_token]
+            tx = int(lower[-2])
+            ty = int(lower[-1])
             ok, msg, _ = shogi_game.request_drop(kind, tx, ty, message.author.id)
             if not ok:
                 await thread.send(f"{message.author.mention} {msg}")
@@ -481,7 +492,7 @@ async def on_message(message: discord.Message):
                 shogi_games.pop(thread.id, None)
             return
 
-        await thread.send(f"{message.author.mention} 入力は `7776` または `P*77` のみです。")
+        await thread.send(f"{message.author.mention} 入力は `7776` または `fu77` のみです。")
         return
 
     # 五目

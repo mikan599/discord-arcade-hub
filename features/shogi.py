@@ -133,8 +133,10 @@ class ShogiGame:
 
         kind = kind.upper()
         tx, ty = tx1 - 1, ty1 - 1
-        if kind not in {"P", "L", "N", "S", "G", "B", "R"}:
-            return False, "打ち駒は P/L/N/S/G/B/R のみです。", False
+        if kind not in {"P", "L", "N", "S", "G", "B", "R", "K"}:
+            return False, "打ち駒は fu/kyou/kei/gin/kin/kaku/hisya/ou 形式で指定してください。", False
+        if kind == "K":
+            return False, "王(ou)は打てません。", False
         if not self._inside(tx, ty):
             return False, "座標は 1..9 で指定してください。", False
         if self.board[ty][tx] is not None:

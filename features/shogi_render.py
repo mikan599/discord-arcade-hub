@@ -102,7 +102,7 @@ def render_shogi_png(game: ShogiGame) -> BytesIO:
             px = left + x * cell + 12
             py = top + y * cell + 10
 
-            if piece.owner == SENTE:
+            if piece.owner == GOTE:
                 d.text((px, py), label, fill=(10, 10, 10, 255), font=font_piece)
             else:
                 tile = Image.new("RGBA", (cell, cell), (0, 0, 0, 0))
