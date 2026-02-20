@@ -1,5 +1,6 @@
 import os
 import re
+import asyncio
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -15,6 +16,8 @@ from features.minesweeper import (
 
 from features.gomoku import GomokuGame, X, O
 from features.gomoku_render import render_gomoku_png
+from features.shogi import ShogiGame, SENTE, GOTE
+from features.shogi_render import render_shogi_png
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(dotenv_path=BASE_DIR / ".env")
@@ -24,8 +27,12 @@ if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN が取得できていません。.env または環境変数を確認してください。")
 
 gomoku_games: dict[int, GomokuGame] = {}
+shogi_games: dict[int, ShogiGame] = {}
 
 MOVE_RE = re.compile(r"^\s*(\d{1,2})\s+(\d{1,2})\s*$")
+SHOGI_MOVE_RE = re.compile(r"^[1-9]{4}$")
+SHOGI_DROP_RE = re.compile(r"^(fu|kyou|kei|gin|kin|kaku|hisya|ou)[1-9]{2}$", re.IGNORECASE)
+SHOGI_YN_RE = re.compile(r"^[ynYN]$")
 
 
 class MyClient(discord.Client):
@@ -95,6 +102,13 @@ async def _send_board_image(thread: discord.Thread, game: GomokuGame, *, note: s
     await thread.send(file=discord.File(fp=png, filename="gomoku.png"))
 
 
+async def _send_shogi_image(thread: discord.Thread, game: ShogiGame, *, note: str | None = None):
+    png = await asyncio.to_thread(render_shogi_png, game)
+    if note:
+        await thread.send(note)
+    await thread.send(file=discord.File(fp=png, filename="shogi.png"))
+
+
 @client.tree.command(name="gomoku_start", description="五目並べを開始（publicスレッド 1440分で続行）")
 @app_commands.describe(
     mode="pvp か ai",
@@ -137,10 +151,9 @@ async def gomoku_start(
         return
 
     starter = interaction.user
-    want_side = side.value  # "X" or "O"
+    want_side = side.value
     board_size = size.value if size else 15
 
-    # pvp相手チェック
     if mode.value == "pvp":
         if opponent is None:
             await interaction.response.send_message("pvp では opponent を指定してください。")
@@ -154,7 +167,6 @@ async def gomoku_start(
     else:
         opponent = None
 
-    # スレッド生成
     if _is_thread_channel(interaction.channel):
         thread: discord.Thread = interaction.channel  # type: ignore
         await interaction.response.send_message("このスレッドで五目並べを開始します。")
@@ -184,7 +196,6 @@ async def gomoku_start(
         await thread.send("このスレッドでは既に対局が進行中です。終了してから開始してください。")
         return
 
-    # ゲーム生成（先手/後手の割当）
     if mode.value == "pvp" and opponent:
         if want_side == "X":
             game = GomokuGame(size=board_size, mode="pvp", player_x=starter.id, player_o=opponent.id)
@@ -195,11 +206,9 @@ async def gomoku_start(
     else:
         lvl = difficulty.value if difficulty else "hard"
         if want_side == "X":
-            # 人間が先手、AIが後手
             game = GomokuGame(size=board_size, mode="ai", player_x=starter.id, player_o=None, ai_level=lvl)
             await thread.send(f"開始: 先手={starter.mention}, 後手=AI (level={lvl})（先手のみ禁じ手あり）")
         else:
-            # 人間が後手、AIが先手（AIにも禁じ手が適用される）
             game = GomokuGame(size=board_size, mode="ai", player_x=None, player_o=starter.id, ai_level=lvl)
             await thread.send(f"開始: 先手=AI (level={lvl}), 後手={starter.mention}（先手のみ禁じ手あり）")
 
@@ -207,10 +216,9 @@ async def gomoku_start(
     await _send_board_image(thread, game)
     await thread.send("操作: スレッド内で `x y` を送信（例: `8 8`）")
 
-    # AIが先手なら、開始直後に1手打つ
     if game.mode == "ai" and game.is_ai_turn():
         ax, ay = game.ai_move()
-        game._place_raw(ax, ay, game.turn)  # turn側がAI
+        game._place_raw(ax, ay, game.turn)
         await _send_board_image(thread, game, note=f"AI move: {ax+1} {ay+1}")
 
 
@@ -255,7 +263,6 @@ async def gomoku_resign(interaction: discord.Interaction):
         return
 
     game.finished = True
-    # 投了した側の逆が勝ち
     if uid == game.player_x:
         game.winner = O
     else:
@@ -293,6 +300,124 @@ async def gomoku_end(interaction: discord.Interaction):
     await interaction.response.send_message("対局を終了しました。")
 
 
+@client.tree.command(name="shogi_start", description="将棋(PvP)を開始（publicスレッド 1440分）")
+@app_commands.describe(opponent="対戦相手")
+async def shogi_start(interaction: discord.Interaction, opponent: discord.Member):
+    if not interaction.guild or not interaction.channel:
+        await interaction.response.send_message("サーバー内のチャンネルで実行してください。")
+        return
+    if opponent.bot:
+        await interaction.response.send_message("botは対戦相手にできません。")
+        return
+    if opponent.id == interaction.user.id:
+        await interaction.response.send_message("自分自身とは対戦できません。")
+        return
+
+    if _is_thread_channel(interaction.channel):
+        thread: discord.Thread = interaction.channel  # type: ignore
+        await interaction.response.send_message("このスレッドで将棋を開始します。")
+    else:
+        parent = interaction.channel
+        name = f"shogi: {_fmt_user(interaction.user)} vs {_fmt_user(opponent)}"
+        try:
+            thread = await parent.create_thread(
+                name=name,
+                type=discord.ChannelType.public_thread,
+                auto_archive_duration=1440,
+                reason="shogi game thread",
+            )
+        except Exception as e:
+            await interaction.response.send_message(f"スレッド作成に失敗しました。\n{e}")
+            return
+
+        await interaction.response.send_message(f"将棋スレッドを作成しました: {thread.jump_url}")
+
+    if thread.id in shogi_games:
+        await thread.send("このスレッドでは既に将棋対局が進行中です。")
+        return
+
+    game = ShogiGame(player_sente=interaction.user.id, player_gote=opponent.id)
+    shogi_games[thread.id] = game
+
+    await thread.send(f"開始: 先手={interaction.user.mention}, 後手={opponent.mention}")
+    await _send_shogi_image(thread, game)
+    await thread.send("入力: 移動 `7776` / 打ち駒 `fu77`。成り可能時は bot が y/n を確認します。")
+
+
+@client.tree.command(name="shogi_show", description="将棋盤を再表示（スレッド内）")
+async def shogi_show(interaction: discord.Interaction):
+    if not interaction.guild or not interaction.channel:
+        await interaction.response.send_message("サーバー内のスレッドで実行してください。")
+        return
+    if not _is_thread_channel(interaction.channel):
+        await interaction.response.send_message("対局はスレッド内で進行します。")
+        return
+
+    thread: discord.Thread = interaction.channel  # type: ignore
+    game = shogi_games.get(thread.id)
+    if not game:
+        await interaction.response.send_message("このスレッドには進行中の将棋対局がありません。")
+        return
+
+    png = await asyncio.to_thread(render_shogi_png, game)
+    await interaction.response.send_message(file=discord.File(fp=png, filename="shogi.png"))
+
+
+@client.tree.command(name="shogi_resign", description="将棋の投了（スレッド内）")
+async def shogi_resign(interaction: discord.Interaction):
+    if not interaction.guild or not interaction.channel:
+        await interaction.response.send_message("サーバー内のスレッドで実行してください。")
+        return
+    if not _is_thread_channel(interaction.channel):
+        await interaction.response.send_message("対局はスレッド内で進行します。")
+        return
+
+    thread: discord.Thread = interaction.channel  # type: ignore
+    game = shogi_games.get(thread.id)
+    if not game:
+        await interaction.response.send_message("このスレッドには進行中の将棋対局がありません。")
+        return
+
+    uid = interaction.user.id
+    is_player = uid in {game.player_sente, game.player_gote}
+    is_admin = isinstance(interaction.user, discord.Member) and interaction.user.guild_permissions.manage_threads
+    if not (is_player or is_admin):
+        await interaction.response.send_message("当事者または管理権限のある人だけ投了できます。")
+        return
+
+    game.finished = True
+    game.winner = GOTE if uid == game.player_sente else SENTE
+    await interaction.response.send_message("投了しました。")
+    await _send_shogi_image(thread, game)
+    shogi_games.pop(thread.id, None)
+
+
+@client.tree.command(name="shogi_end", description="将棋対局を終了（スレッド内）")
+async def shogi_end(interaction: discord.Interaction):
+    if not interaction.guild or not interaction.channel:
+        await interaction.response.send_message("サーバー内のスレッドで実行してください。")
+        return
+    if not _is_thread_channel(interaction.channel):
+        await interaction.response.send_message("対局はスレッド内で進行します。")
+        return
+
+    thread: discord.Thread = interaction.channel  # type: ignore
+    game = shogi_games.get(thread.id)
+    if not game:
+        await interaction.response.send_message("このスレッドには進行中の将棋対局がありません。")
+        return
+
+    uid = interaction.user.id
+    is_player = uid in {game.player_sente, game.player_gote}
+    is_admin = isinstance(interaction.user, discord.Member) and interaction.user.guild_permissions.manage_threads
+    if not (is_player or is_admin):
+        await interaction.response.send_message("当事者またはスレッド管理権限のある人だけ終了できます。")
+        return
+
+    shogi_games.pop(thread.id, None)
+    await interaction.response.send_message("将棋対局を終了しました。")
+
+
 @client.event
 async def on_message(message: discord.Message):
     if message.author.bot:
@@ -302,11 +427,79 @@ async def on_message(message: discord.Message):
         return
 
     thread = message.channel
+
+    # 将棋
+    shogi_game = shogi_games.get(thread.id)
+    if shogi_game:
+        if not shogi_game.can_play(message.author.id):
+            return
+
+        text = message.content.strip()
+        lower = text.lower()
+
+        if shogi_game.pending_move is not None:
+            if SHOGI_YN_RE.fullmatch(text):
+                ok, msg = shogi_game.confirm_pending(message.author.id, promote=(text.lower() == "y"))
+                if not ok:
+                    await thread.send(f"{message.author.mention} {msg}")
+                    return
+                await _send_shogi_image(thread, shogi_game)
+                if shogi_game.finished:
+                    shogi_games.pop(thread.id, None)
+                return
+
+            if SHOGI_MOVE_RE.fullmatch(text) or SHOGI_DROP_RE.fullmatch(lower):
+                await thread.send(f"{message.author.mention} まず y/n を答えてください。")
+            else:
+                await thread.send(f"{message.author.mention} 成りますか？ y/n で答えてください。")
+            return
+
+        if SHOGI_MOVE_RE.fullmatch(text):
+            fx, fy, tx, ty = map(int, text)
+            ok, msg, pending = shogi_game.request_move(fx, fy, tx, ty, message.author.id)
+            if not ok:
+                await thread.send(f"{message.author.mention} {msg}")
+                return
+            if pending:
+                await thread.send(f"{message.author.mention} {msg}")
+                return
+            await _send_shogi_image(thread, shogi_game)
+            if shogi_game.finished:
+                shogi_games.pop(thread.id, None)
+            return
+
+        if SHOGI_DROP_RE.fullmatch(lower):
+            romaji_to_kind = {
+                "fu": "P",
+                "kyou": "L",
+                "kei": "N",
+                "gin": "S",
+                "kin": "G",
+                "kaku": "B",
+                "hisya": "R",
+                "ou": "K",
+            }
+            kind_token = lower[:-2]
+            kind = romaji_to_kind[kind_token]
+            tx = int(lower[-2])
+            ty = int(lower[-1])
+            ok, msg, _ = shogi_game.request_drop(kind, tx, ty, message.author.id)
+            if not ok:
+                await thread.send(f"{message.author.mention} {msg}")
+                return
+            await _send_shogi_image(thread, shogi_game)
+            if shogi_game.finished:
+                shogi_games.pop(thread.id, None)
+            return
+
+        await thread.send(f"{message.author.mention} 入力は `7776` または `fu77` のみです。")
+        return
+
+    # 五目
     game = gomoku_games.get(thread.id)
     if not game:
         return
 
-    # 対局者で、かつ手番の人だけ受け付ける（AI番は無視）
     if not game.can_play(message.author.id):
         return
 
@@ -328,7 +521,6 @@ async def on_message(message: discord.Message):
         gomoku_games.pop(thread.id, None)
         return
 
-    # AI応手（AIの番なら打つ）
     if game.mode == "ai" and game.is_ai_turn():
         ax, ay = game.ai_move()
         game._place_raw(ax, ay, game.turn)
